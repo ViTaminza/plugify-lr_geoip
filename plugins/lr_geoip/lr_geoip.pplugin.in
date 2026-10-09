@@ -1,0 +1,28 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${LR_GEOIP_VERSION}",
+	"name": "lr_geoip",
+	"description": "[LR] GEOIP: writes the country / region / city / country_code of every loaded player into the `<lr_table>_geoip` table, looked up in <configs>/geoip/GeoLite2-City.mmdb. Ported from the Pisex Levels Ranks module LR_ExStatsGeoIP (production plugin lr_geoip). Owns its plgdb connection with the levels_ranks database settings and its own dependency-free MaxMind DB reader. Requires the levels_ranks core; no exported methods.",
+	"author": "Pisex, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/lr_geoip",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "levels_ranks",
+			"constraints": ">=1.0.0"
+		},
+		{
+			"name": "hudmenu",
+			"constraints": ">=1.0.0",
+			"optional": true
+		}
+	],
+	"methods": []
+}
