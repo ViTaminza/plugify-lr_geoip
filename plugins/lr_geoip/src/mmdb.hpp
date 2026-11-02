@@ -14,7 +14,7 @@
 //     subdivisions[0].names.en, city.names.en.
 //
 // Format details, verified against the two shipped databases
-// (tests/geoip_tests.cpp decodes them and checks the results):
+// (tests/lr_geoip_tests.cpp decodes them and checks the results):
 //   * the metadata starts right after the last marker occurrence; its pointers resolve from there;
 //   * the tree is followed by a 16-byte zero separator, then the single data section (GeoLite2
 //     files have exactly one); data pointers and record values both resolve from the first byte
@@ -30,7 +30,7 @@
 //     IPv4-mapped (::ffff:0:0/96) and the zero (::/96) spellings are tried, because the shipped
 //     files answer either.
 //
-// Everything is engine-free and testable (tests/geoip_tests.cpp reads the shipped databases).
+// Everything is engine-free and testable (tests/lr_geoip_tests.cpp reads the shipped databases).
 
 #include <cstdint>
 #include <memory>

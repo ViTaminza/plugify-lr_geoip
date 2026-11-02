@@ -4,39 +4,41 @@
 //     (GeoLite2-City.mmdb and GeoLite2-Country.mmdb) — metadata, the IPv4-in-IPv6 subtree, the
 //     data decoder and the four Location fields,
 //   * MmdbCache: the open database is reused and a replaced file is reopened (a GeoLite2 update),
+//   * the plugin's own path helpers (JoinPath / FileExists / DatabaseCandidates /
+//     ResolveDatabasePath) — the replacement of pisex::JoinPath/FileExists/ResolvePath,
 //   * the address extraction of the original's OnPlayerLoadedHook,
 //   * the SQL layer (`_geoip` CREATE / REPLACE) against SQLite ":memory:" and, when MYSQL_HOST is
 //     set (./test.sh provides it), against MySQL. Rows created in MySQL are deleted at the end.
-
-#include <plg/plugin.hpp>
-
-#include <pisex/paths.hpp>
+//
+// No engine, no Plugify host and no pisexcompat: the executable links only lr_geoip_core (and
+// plgdb), like the other pure-s2sdk LR modules.
+//
+// The GeoLite2 files are third-party data that is not committed. The test looks for a complete
+// City+Country pair at runtime (an explicit LR_GEOIP_TEST_DATA_DIR environment variable, the path
+// CMake recorded, dist/ and the usual checkout/container layouts). With the pair the database
+// sections run, and an unreadable or corrupt database is a real failure. Without it they print an
+// explicit SKIP line and the rest of the suite (path helpers, reader failure paths, address
+// extraction, SQL) still runs. When CMake saw the pair at build time (LR_GEOIP_TEST_HAS_DB=1) but
+// the files are gone at runtime, the test fails instead of hiding a broken data mount.
+//
+// The reader's failure paths (a non-existent path and a non-MMDB file) never need the GeoLite2
+// data: TestOpenFailures() runs unconditionally.
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <vector>
 
 #include "geoip_core.hpp"
 #include "mmdb.hpp"
-
-// A real plugin gets these from PLUGIFY_PLUGIN; the test leaves them null.
-namespace plg {
-GetBaseDirFn GetBaseDir{nullptr};
-GetExtensionsDirFn GetExtensionsDir{nullptr};
-GetConfigsDirFn GetConfigsDir{nullptr};
-GetDataDirFn GetDataDir{nullptr};
-GetLogsDirFn GetLogsDir{nullptr};
-GetCacheDirFn GetCacheDir{nullptr};
-IsLoadedFn IsLoaded{nullptr};
-LogFn Log{nullptr};
-BeginZoneFn BeginZone{nullptr};
-EndZoneFn EndZone{nullptr};
-} // namespace plg
 
 namespace {
 
@@ -87,15 +89,113 @@ void Section(std::string_view name) {
 
 using namespace lr_geoip;
 
-constexpr char kCityDb[] = LR_GEOIP_TEST_DATA_DIR "/GeoLite2-City.mmdb";
-constexpr char kCountryDb[] = LR_GEOIP_TEST_DATA_DIR "/GeoLite2-Country.mmdb";
+// The two database paths, resolved at runtime by ResolveGeoLiteData(); the database sections are
+// called only after a complete City+Country pair was found.
+std::string g_city_db;
+std::string g_country_db;
+
+inline constexpr char kCityFile[] = "GeoLite2-City.mmdb";
+inline constexpr char kCountryFile[] = "GeoLite2-Country.mmdb";
+
+struct GeoLiteData {
+	std::string dir;
+	bool city = false;
+	bool country = false;
+
+	bool Complete() const { return city && country; }
+};
+
+GeoLiteData InspectGeoLiteDir(std::string dir) {
+	GeoLiteData data;
+	data.dir = std::move(dir);
+	if (data.dir.empty()) {
+		return data;
+	}
+	data.city = FileExists(JoinPath(data.dir, kCityFile));
+	data.country = FileExists(JoinPath(data.dir, kCountryFile));
+	return data;
+}
+
+// The places the ~68 MB third-party data can be found: an explicit LR_GEOIP_TEST_DATA_DIR (runtime
+// environment first, then the path CMake recorded), a packaged dist/, and the usual checkout and
+// container layouts. Relative paths are deliberate: the container test runners mount the checkout
+// at /src and run the binary from /src/build/tests, while a host run may start at the repo root.
+std::vector<std::string> GeoLiteCandidates() {
+	std::vector<std::string> candidates;
+	const auto add = [&candidates](std::string candidate) {
+		if (candidate.empty()) {
+			return;
+		}
+		for (const std::string& existing : candidates) {
+			if (existing == candidate) {
+				return;
+			}
+		}
+		candidates.push_back(std::move(candidate));
+	};
+	if (const char* env = std::getenv("LR_GEOIP_TEST_DATA_DIR"); env != nullptr) {
+		add(env);
+	}
+	add(LR_GEOIP_TEST_DATA_DIR);
+	add("dist/configs/geoip");
+	add("plugins/lr_geoip/dist/configs/geoip");
+	add("plugins/lr_geoip/tests/data/geoip");
+	add("ref/prod-27016/addons/configs/geoip");
+	add("ref/prod-27016/game/csgo/addons/configs/geoip");
+	add("../../plugins/lr_geoip/dist/configs/geoip");
+	add("../../plugins/lr_geoip/tests/data/geoip");
+	add("../../ref/prod-27016/addons/configs/geoip");
+	add("../../ref/prod-27016/game/csgo/addons/configs/geoip");
+	add("/ref/prod-27016/addons/configs/geoip");
+	return candidates;
+}
+
+// The first directory that holds BOTH files. A directory with only one of them is returned as a
+// partial result (the caller reports the missing file); tests never run on a partial pair.
+GeoLiteData ResolveGeoLiteData(std::string* tried = nullptr) {
+	GeoLiteData firstPartial;
+	std::string list;
+	for (const std::string& candidate : GeoLiteCandidates()) {
+		if (!list.empty()) {
+			list += ", ";
+		}
+		list += candidate;
+		GeoLiteData data = InspectGeoLiteDir(candidate);
+		if (data.Complete()) {
+			if (tried != nullptr) {
+				*tried = list;
+			}
+			return data;
+		}
+		if (firstPartial.dir.empty() && (data.city || data.country)) {
+			firstPartial = std::move(data);
+		}
+	}
+	if (tried != nullptr) {
+		*tried = list;
+	}
+	return firstPartial;
+}
+
+std::string PartialDescription(const GeoLiteData& data) {
+	if (data.dir.empty()) {
+		return {};
+	}
+	if (data.city) {
+		return "only " + std::string(kCityFile);
+	}
+	if (data.country) {
+		return "only " + std::string(kCountryFile);
+	}
+	return "neither " + std::string(kCityFile) + " nor " + std::string(kCountryFile);
+}
 
 // --- the MaxMind DB reader ----------------------------------------------------------------------
 
 void TestCityDatabase() {
 	Section("GeoLite2-City.mmdb");
 	std::string error;
-	std::unique_ptr<Mmdb> db = Mmdb::Open(kCityDb, &error);
+	std::unique_ptr<Mmdb> db = Mmdb::Open(g_city_db, &error);
 	CHECK(db != nullptr);
 	if (db == nullptr) {
 		std::printf("  open error: %s\n", error.c_str());
@@ -162,7 +262,7 @@ void TestCityDatabase() {
 void TestCityCoverage() {
 	Section("coverage over random public IPv4s");
 	std::string error;
-	std::unique_ptr<Mmdb> db = Mmdb::Open(kCityDb, &error);
+	std::unique_ptr<Mmdb> db = Mmdb::Open(g_city_db, &error);
 	CHECK(db != nullptr);
 	if (db == nullptr) {
 		return;
@@ -216,7 +316,7 @@ void TestCityCoverage() {
 void TestCountryDatabase() {
 	Section("GeoLite2-Country.mmdb");
 	std::string error;
-	std::unique_ptr<Mmdb> db = Mmdb::Open(kCountryDb, &error);
+	std::unique_ptr<Mmdb> db = Mmdb::Open(g_country_db, &error);
 	CHECK(db != nullptr);
 	if (db == nullptr) {
 		std::printf("  open error: %s\n", error.c_str());
@@ -239,10 +339,15 @@ void TestCountryDatabase() {
 	CHECK_EQ_STR(location.country_code, "RU");
 }
 
+// The reader's failure paths do not need the shipped data, so this section always runs - a missing
+// GeoLite2 pair must not hide a broken Mmdb::Open.
 void TestOpenFailures() {
-	Section("reader failure paths");
+	Section("reader failure paths (always run)");
+	const std::string missing = "/nonexistent/GeoLite2-City.mmdb";
+	// A non-existent path is rejected by the path helper as well as by the reader.
+	CHECK(!FileExists(missing));
 	std::string error;
-	CHECK(Mmdb::Open("/nonexistent/GeoLite2-City.mmdb", &error) == nullptr);
+	CHECK(Mmdb::Open(missing, &error) == nullptr);
 	CHECK(!error.empty());
 	std::printf("  error: %s\n", error.c_str());
 
@@ -253,6 +358,7 @@ void TestOpenFailures() {
 		std::fclose(file);
 	}
 	CHECK(Mmdb::Open(junk, &error) == nullptr);
+	CHECK(!error.empty());
 	std::printf("  junk error: %s\n", error.c_str());
 	std::remove(junk.c_str());
 }
@@ -297,19 +403,19 @@ void TestMmdbCache() {
 	CHECK(!error.empty());
 
 	// The first use opens the file, the next one hands out the same open database.
-	const Mmdb* city = cache.Get(kCityDb, &error);
+	const Mmdb* city = cache.Get(g_city_db, &error);
 	CHECK(city != nullptr);
 	if (city == nullptr) {
 		std::printf("  open error: %s\n", error.c_str());
 		return;
 	}
 	CHECK_EQ_STR(city->DatabaseType(), "GeoLite2-City");
-	CHECK(cache.Get(kCityDb, &error) == city);
+	CHECK(cache.Get(g_city_db, &error) == city);
 
 	// A replaced file is reopened: prime the cache with the Country database, overwrite the file
 	// with the City one, and the next Get must read the new file.
 	const std::string temp = "/tmp/lr_geoip_cache_test.mmdb";
-	CHECK(CopyFile(kCountryDb, temp));
+	CHECK(CopyFile(g_country_db, temp));
 	const Mmdb* country = cache.Get(temp, &error);
 	CHECK(country != nullptr);
 	if (country == nullptr) {
@@ -321,7 +427,7 @@ void TestMmdbCache() {
 		CHECK(location.found);
 		CHECK_EQ_STR(location.city, ""); // the Country database carries no city
 
-		CHECK(CopyFile(kCityDb, temp));
+		CHECK(CopyFile(g_city_db, temp));
 		const Mmdb* replaced = cache.Get(temp, &error);
 		CHECK(replaced != nullptr);
 		if (replaced != nullptr) {
@@ -332,7 +438,7 @@ void TestMmdbCache() {
 		std::remove(temp.c_str());
 		CHECK(cache.Get(temp, &error) == nullptr);
 		CHECK(!error.empty());
-		CHECK(CopyFile(kCountryDb, temp));
+		CHECK(CopyFile(g_country_db, temp));
 		const Mmdb* restored = cache.Get(temp, &error);
 		CHECK(restored != nullptr);
 		if (restored != nullptr) {
@@ -342,6 +448,132 @@ void TestMmdbCache() {
 	std::remove(temp.c_str());
 }
 
+// --- the database path helpers (pisex::JoinPath/FileExists/ResolvePath replacement) ---------------
+
+void TestJoinPathAndFileExists() {
+	Section("JoinPath / FileExists");
+	CHECK_EQ_STR(JoinPath("", "GeoLite2-City.mmdb"), "GeoLite2-City.mmdb");
+	CHECK_EQ_STR(JoinPath("/configs", ""), "/configs");
+	CHECK_EQ_STR(JoinPath("", ""), "");
+	CHECK_EQ_STR(JoinPath("/configs", "geoip"), "/configs/geoip");
+	CHECK_EQ_STR(JoinPath("/configs/", "geoip"), "/configs/geoip");
+	CHECK_EQ_STR(JoinPath("/configs", "/geoip"), "/configs/geoip");
+
+	const std::string temp = "/tmp/lr_geoip_file_exists_test.bin";
+	std::remove(temp.c_str());
+	CHECK(!FileExists(temp));
+	CHECK(!FileExists(""));
+	if (FILE* file = std::fopen(temp.c_str(), "wb"); file != nullptr) {
+		std::fputc('x', file);
+		std::fclose(file);
+	}
+	CHECK(FileExists(temp));
+	std::remove(temp.c_str());
+	CHECK(!FileExists(temp));
+}
+
+void TestDatabaseCandidates() {
+	Section("DatabaseCandidates");
+	const std::vector<std::string> both = DatabaseCandidates("/configs", "/base");
+	CHECK_EQ_INT(both.size(), 5);
+	if (both.size() == 5) {
+		CHECK_EQ_STR(both[0], "/configs/geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(both[1], "/configs/lr_geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(both[2], "/base/addons/configs/geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(both[3], "/base/configs/geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(both[4], kLegacyDatabasePath);
+	}
+	// Empty directories are skipped; the working-directory fallback is always last.
+	const std::vector<std::string> configsOnly = DatabaseCandidates("/configs", "");
+	CHECK_EQ_INT(configsOnly.size(), 3);
+	const std::vector<std::string> baseOnly = DatabaseCandidates("", "/base");
+	CHECK_EQ_INT(baseOnly.size(), 3);
+	const std::vector<std::string> none = DatabaseCandidates("", "");
+	CHECK_EQ_INT(none.size(), 1);
+	if (!none.empty()) {
+		CHECK_EQ_STR(none[0], kLegacyDatabasePath);
+	}
+	// <configs>/geoip and <base>/configs/geoip are the same file when configs == <base>/configs.
+	const std::vector<std::string> dedup = DatabaseCandidates("/base/configs", "/base");
+	CHECK_EQ_INT(dedup.size(), 4);
+	if (dedup.size() == 4) {
+		CHECK_EQ_STR(dedup[0], "/base/configs/geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(dedup[1], "/base/configs/lr_geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(dedup[2], "/base/addons/configs/geoip/GeoLite2-City.mmdb");
+		CHECK_EQ_STR(dedup[3], kLegacyDatabasePath);
+	}
+}
+
+std::filesystem::path CreateTempRoot(const std::string& tag) {
+	const std::filesystem::path root =
+		std::filesystem::temp_directory_path() / ("lr_geoip_paths_" + tag);
+	std::error_code error;
+	std::filesystem::remove_all(root, error);
+	std::filesystem::create_directories(root, error);
+	return root;
+}
+
+bool CreateEmptyFile(const std::filesystem::path& path) {
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	std::ofstream file(path, std::ios::binary);
+	return file.good();
+}
+
+void RemovePath(const std::filesystem::path& path) {
+	std::error_code error;
+	std::filesystem::remove(path, error);
+}
+
+// The priority order of the plugin (src/plugin.cpp ResolveDatabasePath): <configs>/geoip, the
+// plugin's own <configs>/lr_geoip, the Metamod layout under <GetBaseDir()>, then the original path
+// relative to the server working directory.
+void TestResolveDatabasePath(const std::string& tag) {
+	Section("ResolveDatabasePath (configs > plugin config > base > working dir)");
+	const std::filesystem::path root = CreateTempRoot(tag);
+	const std::filesystem::path configs = root / "configs";
+	const std::filesystem::path base = root / "base";
+	const std::filesystem::path working = root / "cwd";
+	const std::string primary = (configs / "geoip" / std::string(kDatabaseFile)).string();
+	const std::string own = (configs / "lr_geoip" / std::string(kDatabaseFile)).string();
+	const std::string metamod = (base / "addons/configs/geoip" / std::string(kDatabaseFile)).string();
+	const std::filesystem::path legacy = working / std::string(kLegacyDatabasePath);
+
+	std::error_code error;
+	std::filesystem::create_directories(working, error);
+	const std::filesystem::path previous = std::filesystem::current_path(error);
+	std::filesystem::current_path(working, error);
+
+	// Nothing on disk: no path (the relative candidate is checked against the empty working dir).
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), "");
+
+	CHECK(CreateEmptyFile(legacy)); // the original Metamod path, relative to the working directory
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), kLegacyDatabasePath);
+
+	CHECK(CreateEmptyFile(metamod)); // <base>/addons/configs/geoip
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), metamod);
+
+	CHECK(CreateEmptyFile(own)); // <configs>/lr_geoip (PLUGIN_STANDARD §3)
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), own);
+
+	CHECK(CreateEmptyFile(primary)); // <configs>/geoip wins
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), primary);
+
+	// The first file disappears: the next candidate takes over again (a GeoLite2 update is not a
+	// rename, but a deleted file must not leave the plugin pointing at nothing).
+	RemovePath(primary);
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), own);
+	RemovePath(own);
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), metamod);
+	RemovePath(metamod);
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), kLegacyDatabasePath);
+	RemovePath(legacy);
+	CHECK_EQ_STR(ResolveDatabasePath(configs.string(), base.string()), "");
+
+	std::filesystem::current_path(previous, error);
+	std::filesystem::remove_all(root, error);
+}
+
 // --- the original's address handling --------------------------------------------------------------
 
 void TestExtractIp() {
@@ -349,8 +581,13 @@ void TestExtractIp() {
 	CHECK_EQ_STR(ExtractIp("1.2.3.4:27005"), "1.2.3.4");
 	CHECK_EQ_STR(ExtractIp("1.2.3.4"), "1.2.3.4");
 	CHECK_EQ_STR(ExtractIp("255.255.255.255:1"), "255.255.255.255");
-	// The original's substr(0, find(":")) behaviour (IPv6 falls through it like it did there).
-	CHECK_EQ_STR(ExtractIp("[::1]:27015"), "[");
+	// IPv6: a bracketed address is unwrapped (with or without a port), a bare one is kept whole.
+	CHECK_EQ_STR(ExtractIp("[::1]:27015"), "::1");
+	CHECK_EQ_STR(ExtractIp("[::1]"), "::1");
+	CHECK_EQ_STR(ExtractIp("2001:db8::1"), "2001:db8::1");
+	CHECK_EQ_STR(ExtractIp("::1"), "::1");
+	CHECK_EQ_STR(ExtractIp("["), "");
+	CHECK_EQ_STR(ExtractIp("[]"), "");
 	CHECK_EQ_STR(ExtractIp(""), "");
 	CHECK_EQ_STR(ExtractIp("<unknown>"), "");
 	CHECK_EQ_STR(ExtractIp(":27015"), "");
@@ -401,6 +638,8 @@ void TestDatabase(const plgdb::Config& config, std::string_view label, const std
 		return;
 	}
 	CHECK_EQ_STR(TableName("lvl_base"), "lvl_base_geoip");
+	// The IPv6 address of a dual-stack client must fit the column.
+	CHECK(CreateTableSql(table, plgdb::Driver::MySQL).find("`clientip` varchar(45)") != std::string::npos);
 	CHECK(db->QuerySync(CreateTableSql(table, db->GetDriver()), {}).Ok());
 
 	// The row of a lookup (the OnPlayerLoadedHook path).
@@ -453,11 +692,47 @@ int main() {
 	std::mt19937_64 rng(device());
 	const std::string tag = std::to_string(rng() % 1000000ULL);
 
-	TestCityDatabase();
-	TestCityCoverage();
-	TestCountryDatabase();
+	// The reader's failure paths do not need the GeoLite2 files: run them first and unconditionally,
+	// so a missing database pair cannot mask a regression in Mmdb::Open.
 	TestOpenFailures();
-	TestMmdbCache();
+
+	// The GeoLite2 databases are third-party data that is not committed (see CMakeLists.txt). The
+	// directory is re-resolved at runtime, so the same binary works in a checkout, in the container
+	// with the data mounted at /ref, and in a packaged tree. The sections run only with BOTH files;
+	// a partial installation is reported explicitly and skipped.
+	std::string tried;
+	const GeoLiteData data = ResolveGeoLiteData(&tried);
+	constexpr bool kDataExpected = LR_GEOIP_TEST_HAS_DB != 0;
+	if (data.Complete()) {
+		g_city_db = JoinPath(data.dir, kCityFile);
+		g_country_db = JoinPath(data.dir, kCountryFile);
+		std::printf("== GeoLite2 data: %s\n", data.dir.c_str());
+		TestCityDatabase();
+		TestCityCoverage();
+		TestCountryDatabase();
+		TestMmdbCache();
+	} else if (kDataExpected) {
+		// CMake found both files at build time: their disappearance is an environment/deployment
+		// error. Fail loudly instead of hiding a broken test-data mount behind a SKIP.
+		std::string partial;
+		if (!data.dir.empty()) {
+			partial = "; " + PartialDescription(data) + " in " + data.dir;
+		}
+		std::printf("FAIL [GeoLite2] the databases were present at build time, but no complete "
+					"City+Country pair is visible now%s; tried: %s\n",
+					partial.c_str(), tried.c_str());
+		++g_failures;
+	} else if (!data.dir.empty()) {
+		std::printf("-- SKIP GeoLite2 sections: both %s and %s are required; %s in %s (tried: %s)\n",
+					kCityFile, kCountryFile, PartialDescription(data).c_str(), data.dir.c_str(),
+					tried.c_str());
+	} else {
+		std::printf("-- SKIP GeoLite2 sections: neither %s nor %s found; tried: %s\n", kCityFile,
+					kCountryFile, tried.c_str());
+	}
+	TestJoinPathAndFileExists();
+	TestDatabaseCandidates();
+	TestResolveDatabasePath(tag);
 	TestExtractIp();
 
 	TestDatabase(SqliteConfig(), "sqlite (:memory:)", "lvl_base_geoip_sqlite", /*cleanup=*/false);
